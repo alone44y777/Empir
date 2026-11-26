@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "rewrites": [
+    { "source": "/", "destination": "/api/inspect" },
+    { "source": "/inspect", "destination": "/api/inspect" }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "Access-Control-Allow-Origin", "value": "*" },
+        { "key": "Access-Control-Allow-Methods", "value": "GET, POST, OPTIONS" },
+        { "key": "Access-Control-Allow-Headers", "value": "Content-Type" },
+        { "key": "X-Developer", "value": "Dark Empire" },
+        { "key": "X-Owner", "value": "Sardar Daud Arain" }
+      ]
+    }
+  ]
+}
