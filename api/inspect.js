@@ -3,6 +3,8 @@
 // Serverless Website Source, API & Asset Inspector (Zero-Deps)
 // ============================================================
 
+import crypto from "crypto";
+
 const MAX_HTML_BYTES = 1.8 * 1024 * 1024; // 1.8 MB memory guard
 const FETCH_TIMEOUT_MS = 7500; // 7.5s timeout guard
 
@@ -58,7 +60,7 @@ function normalizeUrl(raw) {
 
 function resolveAbsolute(baseUrl, relativeUrl) {
   if (!relativeUrl) return null;
-  const trimmed = relativeUrl.trim();
+  const trimmed = String(relativeUrl).trim();
   if (
     !trimmed ||
     trimmed.startsWith("data:") ||
@@ -91,10 +93,176 @@ function injectTwoPlaceBranding(html) {
     `     Owner : Sardar Daud Arain\n` +
     `===================================================== -->`;
 
-  return topBanner + html.trim() + bottomBanner;
+  return topBanner + String(html || "").trim() + bottomBanner;
 }
 
-async function safeFetchText(url, timeoutMs = FETCH_TIMEOUT_MS, maxBytes = MAX_HTML_BYTES) {
+function tryAesVariants(keyBuf, ivBuf, cipherBuf) {
+  const candidates = [];
+
+  if (keyBuf.length === 16) candidates.push("aes-128-cbc", "aes-128-ecb");
+  if (keyBuf.length === 24) candidates.push("aes-192-cbc", "aes-192-ecb");
+  if (keyBuf.length === 32) candidates.push("aes-256-cbc", "aes-256-ecb");
+
+  for (const algo of candidates) {
+    for (const autoPad of [true, false]) {
+      try {
+        const ivArg = algo.endsWith("-ecb") ? null : ivBuf;
+        const decipher = crypto.createDecipheriv(algo, keyBuf, ivArg);
+        decipher.setAutoPadding(autoPad);
+        const out = Buffer.concat([decipher.update(cipherBuf), decipher.final()]);
+        if (out && out.length > 0) {
+          return {
+            ok: true,
+            algo,
+            autoPad,
+            hex: out.toString("hex").toLowerCase(),
+            utf8: out.toString("utf8")
+          };
+        }
+      } catch {
+        // Agla mode try karega
+      }
+    }
+  }
+
+  return { ok: false };
+}
+
+function decodeWeakEncodings(text) {
+  const decodedSnippets = [];
+
+  // 1. atob("...") یا Base64 strings کا جائزہ
+  const b64Matches = text.matchAll(/(?:atob\s*\(\s*["']([A-Za-z0-9+/=]{16,})["']\s*\)|["']([A-Za-z0-9+/]{24,}={0,2})["'])/g);
+  let b64Count = 0;
+  for (const m of b64Matches) {
+    if (b64Count >= 10) break;
+    const rawB64 = m[1] || m[2];
+    if (!rawB64 || rawB64.length % 4 !== 0) continue;
+    try {
+      const buf = Buffer.from(rawB64, "base64");
+      const str = buf.toString("utf8");
+      const printableRatio = (str.match(/[\x20-\x7e\r\n\t]/g) || []).length / Math.max(str.length, 1);
+      if (printableRatio > 0.85 && str.trim().length > 4) {
+        decodedSnippets.push({ type: "base64", decoded: str.slice(0, 1500) });
+        b64Count++;
+      }
+    } catch {
+      // Ignore invalid base64
+    }
+  }
+
+  // 2. Hex escape sequences (\x68\x74...) کا جائزہ
+  const hexEscMatches = text.matchAll(/((?:\\x[0-9a-fA-F]{2}){4,})/g);
+  let hexCount = 0;
+  for (const m of hexEscMatches) {
+    if (hexCount >= 10) break;
+    const hexClean = m[1].replace(/\\x/g, "");
+    try {
+      const str = Buffer.from(hexClean, "hex").toString("utf8");
+      const printableRatio = (str.match(/[\x20-\x7e\r\n\t]/g) || []).length / Math.max(str.length, 1);
+      if (printableRatio > 0.85 && str.trim().length > 2) {
+        decodedSnippets.push({ type: "hex-escape", decoded: str.slice(0, 1500) });
+        hexCount++;
+      }
+    } catch {
+      // Ignore
+    }
+  }
+
+  return decodedSnippets;
+}
+
+function attemptCodeDecryption(htmlOrCode) {
+  const text = String(htmlOrCode || "");
+
+  // Step A: AES __test cookie / challenge pattern
+  const aesMatch = text.match(
+    /a\s*=\s*toNumbers\(\s*["']([0-9a-fA-F]+)["']\s*\)\s*,\s*b\s*=\s*toNumbers\(\s*["']([0-9a-fA-F]+)["']\s*\)\s*,\s*c\s*=\s*toNumbers\(\s*["']([0-9a-fA-F]+)["']\s*\)/i
+  );
+
+  if (aesMatch) {
+    const key = Buffer.from(aesMatch[1], "hex");
+    const iv = Buffer.from(aesMatch[2], "hex");
+    const cipherBuf = Buffer.from(aesMatch[3], "hex");
+    const redirectMatch = text.match(/location\.href\s*=\s*["']([^"']+)["']/i);
+    const redirectUrl = redirectMatch ? redirectMatch[1] : null;
+
+    const aesResult = tryAesVariants(key, iv, cipherBuf);
+    if (aesResult.ok) {
+      return {
+        was_encrypted: true,
+        attempted: true,
+        decrypted: true,
+        method: `aes-challenge (${aesResult.algo})`,
+        cookie_value: aesResult.hex,
+        redirect_url: redirectUrl,
+        unpacked_text: aesResult.utf8,
+        message: "Encrypted challenge decrypt ho gaya hai aur cookie/redirect nikal li gayi hai."
+      };
+    }
+
+    return {
+      was_encrypted: true,
+      attempted: true,
+      decrypted: false,
+      method: "aes-challenge",
+      cookie_value: null,
+      redirect_url: redirectUrl,
+      unpacked_text: "",
+      message: "Code encrypted tha, decrypt karne ki koshish ki gayi, lekin decrypt nahi ho saka."
+    };
+  }
+
+  // Step B: Weak Base64 / Hex decoding attempt
+  const weakDecoded = decodeWeakEncodings(text);
+  const mergedDecodedText = weakDecoded.map((item) => item.decoded).join("\n");
+
+  // Step C: Heavy obfuscation / packer detection
+  const looksObfuscated =
+    /eval\s*\(\s*function\s*\(\s*p\s*,\s*a\s*,\s*c\s*,\s*k\s*,\s*e\s*,/i.test(text) ||
+    /_0x[a-f0-9]{4,}/i.test(text) ||
+    /slowAES\.decrypt/i.test(text) ||
+    /CryptoJS\.(AES|DES|RC4|Rabbit)\.(encrypt|decrypt)/i.test(text);
+
+  if (weakDecoded.length > 0 && !looksObfuscated) {
+    return {
+      was_encrypted: true,
+      attempted: true,
+      decrypted: true,
+      method: weakDecoded.map((d) => d.type).join(", "),
+      cookie_value: null,
+      redirect_url: null,
+      unpacked_text: mergedDecodedText,
+      message: "Encoded code ko decode karne ki koshish kamyab rahi."
+    };
+  }
+
+  if (looksObfuscated) {
+    return {
+      was_encrypted: true,
+      attempted: true,
+      decrypted: false,
+      method: "obfuscated-or-encrypted-js",
+      cookie_value: null,
+      redirect_url: null,
+      unpacked_text: mergedDecodedText,
+      message: "Code encrypted tha, decrypt karne ki koshish ki gayi, lekin decrypt nahi ho saka."
+    };
+  }
+
+  return {
+    was_encrypted: false,
+    attempted: false,
+    decrypted: false,
+    method: "none",
+    cookie_value: null,
+    redirect_url: null,
+    unpacked_text: "",
+    message: "Koi encrypted code block nahi mila."
+  };
+}
+
+async function safeFetchText(url, timeoutMs = FETCH_TIMEOUT_MS, maxBytes = MAX_HTML_BYTES, extraHeaders = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const start = Date.now();
@@ -108,7 +276,8 @@ async function safeFetchText(url, timeoutMs = FETCH_TIMEOUT_MS, maxBytes = MAX_H
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9"
+        "Accept-Language": "en-US,en;q=0.9",
+        ...extraHeaders
       }
     });
 
@@ -201,7 +370,6 @@ function extractLogos(html, baseUrl, ogImage) {
     }
   };
 
-  // 1. Favicon & Apple Touch Icons
   const linkTags = html.match(/<link\b[^>]*>/gi) || [];
   for (const tag of linkTags) {
     const rel = (tag.match(/rel=["']([^"']+)["']/i) || [])[1] || "";
@@ -211,7 +379,6 @@ function extractLogos(html, baseUrl, ogImage) {
     }
   }
 
-  // 2. <img> tags with "logo" or "brand" in src, alt, class, or id
   const imgTags = html.match(/<img\b[^>]*>/gi) || [];
   for (const tag of imgTags) {
     const src = (tag.match(/src=["']([^"']+)["']/i) || [])[1] || "";
@@ -220,7 +387,6 @@ function extractLogos(html, baseUrl, ogImage) {
     }
   }
 
-  // 3. OpenGraph Logo/Image fallback
   if (ogImage && /logo|icon|brand/i.test(ogImage)) {
     addLogo(ogImage, "og-brand-image");
   }
@@ -282,7 +448,6 @@ function extractAssets(html, baseUrl) {
 function extractWebApis(contentBlob, baseUrl) {
   const apiSet = new Set();
 
-  // Pattern 1: Full URLs containing /api/, /v1/, /v2/, /v3/, /graphql, /rest/, or api. subdomain
   const fullApiRegex =
     /https?:\/\/[a-zA-Z0-9.-]+(?:\/[a-zA-Z0-9._~:/?#[\]@!$&'()*+,;=%-]*)?(?:\/api\/|\/v[1-9]\d*\/|\/graphql|\/rest\/|api\.[a-zA-Z0-9.-]+)[a-zA-Z0-9._~:/?#[\]@!$&'()*+,;=%-]*/gi;
 
@@ -291,7 +456,6 @@ function extractWebApis(contentBlob, baseUrl) {
     if (clean.length <= 220) apiSet.add(clean);
   }
 
-  // Pattern 2: Relative API routes inside fetch("/api/...") or axios.get('/api/...')
   const relApiRegex = /["'`](\/(?:api|v[1-9]\d*|graphql|rest)\/[a-zA-Z0-9._~:/?#@!$&()*+,;=%-]+)["'`]/gi;
   for (const m of contentBlob.matchAll(relApiRegex)) {
     const abs = resolveAbsolute(baseUrl, m[1]);
@@ -336,7 +500,6 @@ export default async function handler(req, res) {
   const mode = String(query.mode || body.mode || "full").toLowerCase();
   const deepScan = String(query.deep || body.deep || "true").toLowerCase() !== "false";
 
-  // API Documentation / Home Endpoint when no URL is given
   if (!rawUrl) {
     res.setHeader("Cache-Control", "public, s-maxage=3600");
     return res.status(200).json({
@@ -373,7 +536,6 @@ export default async function handler(req, res) {
     });
   }
 
-  // Prevent self-loop requests
   const currentHost = (req.headers.host || "").split(":")[0].toLowerCase();
   if (currentHost && parsedUrl.hostname.toLowerCase() === currentHost) {
     return res.status(400).json({
@@ -386,11 +548,11 @@ export default async function handler(req, res) {
     });
   }
 
-  const result = await safeFetchText(parsedUrl.href);
-  if (!result.ok) {
+  let fetchResult = await safeFetchText(parsedUrl.href);
+  if (!fetchResult.ok) {
     return res.status(502).json({
       success: false,
-      error: result.error || "Unable to fetch target website.",
+      error: fetchResult.error || "Unable to fetch target website.",
       branding: {
         devp: "Dark Empire",
         owner: "Sardar Daud Arain"
@@ -398,14 +560,41 @@ export default async function handler(req, res) {
     });
   }
 
-  const baseUrl = result.finalUrl;
-  const rawHtml = result.text;
+  let decryptionInfo = attemptCodeDecryption(fetchResult.text);
+
+  // Agar AES cookie challenge decrypt ho jaye aur redirect URL mile to cookie ke sath dobara fetch karein
+  if (
+    decryptionInfo.was_encrypted &&
+    decryptionInfo.decrypted &&
+    decryptionInfo.cookie_value &&
+    decryptionInfo.redirect_url
+  ) {
+    const nextTarget = resolveAbsolute(fetchResult.finalUrl, decryptionInfo.redirect_url);
+    if (nextTarget) {
+      const retryResult = await safeFetchText(nextTarget, FETCH_TIMEOUT_MS, MAX_HTML_BYTES, {
+        Cookie: `__test=${decryptionInfo.cookie_value}`
+      });
+      if (retryResult.ok && retryResult.text && retryResult.text.trim().length > 0) {
+        fetchResult = retryResult;
+        const afterRetryCheck = attemptCodeDecryption(fetchResult.text);
+        if (!afterRetryCheck.was_encrypted) {
+          decryptionInfo = {
+            ...decryptionInfo,
+            message: "AES challenge bypass aur retry kamyab raha; اصل صفحہ حاصل کر لیا گیا ہے۔"
+          };
+        }
+      }
+    }
+  }
+
+  const baseUrl = fetchResult.finalUrl;
+  const rawHtml = fetchResult.text;
   const brandedHtml = injectTwoPlaceBranding(rawHtml);
 
-  // Mode: Raw HTML Download / View
+  res.setHeader("Cache-Control", "public, s-maxage=300, stale-while-revalidate=600");
+
   if (mode === "html" || mode === "raw") {
     res.setHeader("Content-Type", "text/html; charset=utf-8");
-    res.setHeader("Cache-Control", "public, s-maxage=300, stale-while-revalidate=600");
     return res.status(200).send(brandedHtml);
   }
 
@@ -413,10 +602,9 @@ export default async function handler(req, res) {
   const logos = extractLogos(rawHtml, baseUrl, meta.og_image);
   const socialLinks = extractSocialLinks(rawHtml, baseUrl);
   const assets = extractAssets(rawHtml, baseUrl);
-  const techHints = detectTechHints(rawHtml, result.headers);
+  const techHints = detectTechHints(rawHtml, fetchResult.headers);
 
-  // Deep scan up to 3 external JS bundles to discover embedded API endpoints
-  let combinedScanText = rawHtml;
+  let combinedScanText = `${rawHtml}\n${decryptionInfo.unpacked_text || ""}`;
   if (deepScan && assets.scripts.length > 0 && (mode === "full" || mode === "apis")) {
     const topScripts = assets.scripts.slice(0, 3);
     const scriptResults = await Promise.all(
@@ -431,8 +619,13 @@ export default async function handler(req, res) {
 
   const webApis = extractWebApis(combinedScanText, baseUrl);
 
-  // Edge Cache for long-term stability and low Vercel usage
-  res.setHeader("Cache-Control", "public, s-maxage=300, stale-while-revalidate=600");
+  const cleanDecryptionStatus = {
+    was_encrypted: decryptionInfo.was_encrypted,
+    attempted: decryptionInfo.attempted,
+    decrypted: decryptionInfo.decrypted,
+    method: decryptionInfo.method,
+    message: decryptionInfo.message
+  };
 
   if (mode === "apis") {
     return res.status(200).json({
@@ -440,6 +633,7 @@ export default async function handler(req, res) {
       target: baseUrl,
       total_apis: webApis.length,
       web_apis: webApis,
+      decryption_status: cleanDecryptionStatus,
       branding: {
         devp: "Dark Empire",
         owner: "Sardar Daud Arain"
@@ -453,6 +647,7 @@ export default async function handler(req, res) {
       target: baseUrl,
       total_logos: logos.length,
       logos,
+      decryption_status: cleanDecryptionStatus,
       branding: {
         devp: "Dark Empire",
         owner: "Sardar Daud Arain"
@@ -466,6 +661,7 @@ export default async function handler(req, res) {
       target: baseUrl,
       total_socials: socialLinks.length,
       social_links: socialLinks,
+      decryption_status: cleanDecryptionStatus,
       branding: {
         devp: "Dark Empire",
         owner: "Sardar Daud Arain"
@@ -473,16 +669,16 @@ export default async function handler(req, res) {
     });
   }
 
-  // Default: Full Comprehensive Response
   return res.status(200).json({
     success: true,
     target: {
       input_url: parsedUrl.href,
       final_url: baseUrl,
-      status_code: result.status,
-      response_time_ms: result.responseTimeMs,
-      truncated: result.truncated
+      status_code: fetchResult.status,
+      response_time_ms: fetchResult.responseTimeMs,
+      truncated: fetchResult.truncated
     },
+    decryption_status: cleanDecryptionStatus,
     meta,
     tech_hints: techHints,
     web_apis: {
@@ -513,5 +709,4 @@ export default async function handler(req, res) {
       owner: "Sardar Daud Arain"
     }
   });
-  }
-                                  
+}
