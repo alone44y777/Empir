@@ -120,7 +120,7 @@ function tryAesVariants(keyBuf, ivBuf, cipherBuf) {
           };
         }
       } catch {
-        // Agla mode try karega
+        // Next cipher variant
       }
     }
   }
@@ -130,43 +130,83 @@ function tryAesVariants(keyBuf, ivBuf, cipherBuf) {
 
 function decodeWeakEncodings(text) {
   const decodedSnippets = [];
+  const seen = new Set();
 
-  // 1. atob("...") یا Base64 strings کا جائزہ
-  const b64Matches = text.matchAll(/(?:atob\s*\(\s*["']([A-Za-z0-9+/=]{16,})["']\s*\)|["']([A-Za-z0-9+/]{24,}={0,2})["'])/g);
+  const pushUnique = (type, decoded) => {
+    const clean = String(decoded || "").trim();
+    if (!clean || clean.length < 4) return;
+    const key = clean.slice(0, 120);
+    if (seen.has(key)) return;
+    seen.add(key);
+    decodedSnippets.push({ type, decoded: clean.slice(0, 4000) });
+  };
+
+  // 1. Base64 strings & atob("...")
+  const b64Matches = text.matchAll(
+    /(?:atob\s*\(\s*["']([A-Za-z0-9+/=]{12,})["']\s*\)|["']([A-Za-z0-9+/]{20,}={0,2})["'])/g
+  );
   let b64Count = 0;
   for (const m of b64Matches) {
-    if (b64Count >= 10) break;
+    if (b64Count >= 20) break;
     const rawB64 = m[1] || m[2];
     if (!rawB64 || rawB64.length % 4 !== 0) continue;
     try {
-      const buf = Buffer.from(rawB64, "base64");
-      const str = buf.toString("utf8");
-      const printableRatio = (str.match(/[\x20-\x7e\r\n\t]/g) || []).length / Math.max(str.length, 1);
-      if (printableRatio > 0.85 && str.trim().length > 4) {
-        decodedSnippets.push({ type: "base64", decoded: str.slice(0, 1500) });
+      const str = Buffer.from(rawB64, "base64").toString("utf8");
+      const printable = (str.match(/[\x20-\x7e\r\n\t]/g) || []).length / Math.max(str.length, 1);
+      if (printable > 0.85) {
+        pushUnique("base64", str);
         b64Count++;
       }
-    } catch {
-      // Ignore invalid base64
-    }
+    } catch {}
   }
 
-  // 2. Hex escape sequences (\x68\x74...) کا جائزہ
-  const hexEscMatches = text.matchAll(/((?:\\x[0-9a-fA-F]{2}){4,})/g);
+  // 2. Hex escapes (\x68\x74...)
+  const hexEscMatches = text.matchAll(/((?:\\x[0-9a-fA-F]{2}){3,})/g);
   let hexCount = 0;
   for (const m of hexEscMatches) {
-    if (hexCount >= 10) break;
+    if (hexCount >= 20) break;
     const hexClean = m[1].replace(/\\x/g, "");
     try {
       const str = Buffer.from(hexClean, "hex").toString("utf8");
-      const printableRatio = (str.match(/[\x20-\x7e\r\n\t]/g) || []).length / Math.max(str.length, 1);
-      if (printableRatio > 0.85 && str.trim().length > 2) {
-        decodedSnippets.push({ type: "hex-escape", decoded: str.slice(0, 1500) });
+      const printable = (str.match(/[\x20-\x7e\r\n\t]/g) || []).length / Math.max(str.length, 1);
+      if (printable > 0.85) {
+        pushUnique("hex-escape", str);
         hexCount++;
       }
-    } catch {
-      // Ignore
-    }
+    } catch {}
+  }
+
+  // 3. Unicode escapes (\u003c\u0073...)
+  const uniMatches = text.matchAll(/((?:\\u[0-9a-fA-F]{4}){3,})/g);
+  let uniCount = 0;
+  for (const m of uniMatches) {
+    if (uniCount >= 20) break;
+    try {
+      const str = JSON.parse(`"${m[1]}"`);
+      const printable = (str.match(/[\x20-\x7e\r\n\t]/g) || []).length / Math.max(str.length, 1);
+      if (printable > 0.85) {
+        pushUnique("unicode-escape", str);
+        uniCount++;
+      }
+    } catch {}
+  }
+
+  // 4. String.fromCharCode(104, 116, 116, ...)
+  const charCodeMatches = text.matchAll(/String\.fromCharCode\s*\(\s*([0-9,\s]{8,})\s*\)/gi);
+  let ccCount = 0;
+  for (const m of charCodeMatches) {
+    if (ccCount >= 15) break;
+    try {
+      const codes = m[1]
+        .split(",")
+        .map((n) => Number(n.trim()))
+        .filter((n) => Number.isFinite(n) && n > 0 && n < 1114111);
+      if (codes.length >= 3) {
+        const str = String.fromCharCode(...codes);
+        pushUnique("fromCharCode", str);
+        ccCount++;
+      }
+    } catch {}
   }
 
   return decodedSnippets;
@@ -174,6 +214,8 @@ function decodeWeakEncodings(text) {
 
 function attemptCodeDecryption(htmlOrCode) {
   const text = String(htmlOrCode || "");
+  const linesCount = text ? text.split("\n").length : 0;
+  const isHeavyMinifiedBlob = text.length > 40000 && linesCount <= 25;
 
   // Step A: AES __test cookie / challenge pattern
   const aesMatch = text.match(
@@ -213,18 +255,18 @@ function attemptCodeDecryption(htmlOrCode) {
     };
   }
 
-  // Step B: Weak Base64 / Hex decoding attempt
+  // Step B: Weak encoding / obfuscation attempt
   const weakDecoded = decodeWeakEncodings(text);
   const mergedDecodedText = weakDecoded.map((item) => item.decoded).join("\n");
 
-  // Step C: Heavy obfuscation / packer detection
   const looksObfuscated =
-    /eval\s*\(\s*function\s*\(\s*p\s*,\s*a\s*,\s*c\s*,\s*k\s*,\s*e\s*,/i.test(text) ||
-    /_0x[a-f0-9]{4,}/i.test(text) ||
-    /slowAES\.decrypt/i.test(text) ||
-    /CryptoJS\.(AES|DES|RC4|Rabbit)\.(encrypt|decrypt)/i.test(text);
+    isHeavyMinifiedBlob ||
+    /eval\s*\(/i.test(text) ||
+    /_0x[a-f0-9]{3,}/i.test(text) ||
+    /slowAES|CryptoJS|atob\s*\(|fromCharCode/i.test(text) ||
+    /(?:\\x[0-9a-fA-F]{2}){3,}|(?:\\u[0-9a-fA-F]{4}){3,}/.test(text);
 
-  if (weakDecoded.length > 0 && !looksObfuscated) {
+  if (weakDecoded.length > 0) {
     return {
       was_encrypted: true,
       attempted: true,
@@ -233,7 +275,7 @@ function attemptCodeDecryption(htmlOrCode) {
       cookie_value: null,
       redirect_url: null,
       unpacked_text: mergedDecodedText,
-      message: "Encoded code ko decode karne ki koshish kamyab rahi."
+      message: "Encoded/packed code mein decryption/decoding ki koshish ki gayi aur data nikal liya gaya."
     };
   }
 
@@ -242,11 +284,11 @@ function attemptCodeDecryption(htmlOrCode) {
       was_encrypted: true,
       attempted: true,
       decrypted: false,
-      method: "obfuscated-or-encrypted-js",
+      method: isHeavyMinifiedBlob ? "minified-bundle-scan" : "protected-or-obfuscated-js",
       cookie_value: null,
       redirect_url: null,
-      unpacked_text: mergedDecodedText,
-      message: "Code encrypted tha, decrypt karne ki koshish ki gayi, lekin decrypt nahi ho saka."
+      unpacked_text: "",
+      message: "Code encrypted ya heavy packed/protected laga, decrypt karne ki koshish ki gayi, lekin decrypt nahi ho saka."
     };
   }
 
@@ -580,7 +622,7 @@ export default async function handler(req, res) {
         if (!afterRetryCheck.was_encrypted) {
           decryptionInfo = {
             ...decryptionInfo,
-            message: "AES challenge bypass aur retry kamyab raha; اصل صفحہ حاصل کر لیا گیا ہے۔"
+            message: "AES challenge bypass aur retry kamyab raha; actual page fetch ho gaya."
           };
         }
       }
