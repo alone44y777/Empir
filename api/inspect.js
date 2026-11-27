@@ -138,16 +138,16 @@ function decodeWeakEncodings(text) {
     const key = clean.slice(0, 120);
     if (seen.has(key)) return;
     seen.add(key);
-    decodedSnippets.push({ type, decoded: clean.slice(0, 4000) });
+    decodedSnippets.push({ type, decoded: clean.slice(0, 5000) });
   };
 
-  // 1. Base64 strings & atob("...")
+  // 1. Base64 & atob(...)
   const b64Matches = text.matchAll(
     /(?:atob\s*\(\s*["']([A-Za-z0-9+/=]{12,})["']\s*\)|["']([A-Za-z0-9+/]{20,}={0,2})["'])/g
   );
   let b64Count = 0;
   for (const m of b64Matches) {
-    if (b64Count >= 20) break;
+    if (b64Count >= 25) break;
     const rawB64 = m[1] || m[2];
     if (!rawB64 || rawB64.length % 4 !== 0) continue;
     try {
@@ -164,7 +164,7 @@ function decodeWeakEncodings(text) {
   const hexEscMatches = text.matchAll(/((?:\\x[0-9a-fA-F]{2}){3,})/g);
   let hexCount = 0;
   for (const m of hexEscMatches) {
-    if (hexCount >= 20) break;
+    if (hexCount >= 25) break;
     const hexClean = m[1].replace(/\\x/g, "");
     try {
       const str = Buffer.from(hexClean, "hex").toString("utf8");
@@ -180,7 +180,7 @@ function decodeWeakEncodings(text) {
   const uniMatches = text.matchAll(/((?:\\u[0-9a-fA-F]{4}){3,})/g);
   let uniCount = 0;
   for (const m of uniMatches) {
-    if (uniCount >= 20) break;
+    if (uniCount >= 25) break;
     try {
       const str = JSON.parse(`"${m[1]}"`);
       const printable = (str.match(/[\x20-\x7e\r\n\t]/g) || []).length / Math.max(str.length, 1);
@@ -191,7 +191,7 @@ function decodeWeakEncodings(text) {
     } catch {}
   }
 
-  // 4. String.fromCharCode(104, 116, 116, ...)
+  // 4. String.fromCharCode(...)
   const charCodeMatches = text.matchAll(/String\.fromCharCode\s*\(\s*([0-9,\s]{8,})\s*\)/gi);
   let ccCount = 0;
   for (const m of charCodeMatches) {
@@ -215,9 +215,8 @@ function decodeWeakEncodings(text) {
 function attemptCodeDecryption(htmlOrCode) {
   const text = String(htmlOrCode || "");
   const linesCount = text ? text.split("\n").length : 0;
-  const isHeavyMinifiedBlob = text.length > 40000 && linesCount <= 25;
+  const isHeavyMinifiedBlob = text.length > 25000 && linesCount <= 30;
 
-  // Step A: AES __test cookie / challenge pattern
   const aesMatch = text.match(
     /a\s*=\s*toNumbers\(\s*["']([0-9a-fA-F]+)["']\s*\)\s*,\s*b\s*=\s*toNumbers\(\s*["']([0-9a-fA-F]+)["']\s*\)\s*,\s*c\s*=\s*toNumbers\(\s*["']([0-9a-fA-F]+)["']\s*\)/i
   );
@@ -255,7 +254,6 @@ function attemptCodeDecryption(htmlOrCode) {
     };
   }
 
-  // Step B: Weak encoding / obfuscation attempt
   const weakDecoded = decodeWeakEncodings(text);
   const mergedDecodedText = weakDecoded.map((item) => item.decoded).join("\n");
 
@@ -489,6 +487,7 @@ function extractAssets(html, baseUrl) {
 
 function extractWebApis(contentBlob, baseUrl) {
   const apiSet = new Set();
+  const extraUrlSet = new Set();
 
   const fullApiRegex =
     /https?:\/\/[a-zA-Z0-9.-]+(?:\/[a-zA-Z0-9._~:/?#[\]@!$&'()*+,;=%-]*)?(?:\/api\/|\/v[1-9]\d*\/|\/graphql|\/rest\/|api\.[a-zA-Z0-9.-]+)[a-zA-Z0-9._~:/?#[\]@!$&'()*+,;=%-]*/gi;
@@ -504,7 +503,22 @@ function extractWebApis(contentBlob, baseUrl) {
     if (abs && abs.length <= 220) apiSet.add(abs);
   }
 
-  return Array.from(apiSet);
+  // Broader HTTP(S) endpoints inside code/bundles (excluding common W3C/schema/font noise)
+  const anyHttpRegex = /https?:\/\/[a-zA-Z0-9.-]+(?:\/[a-zA-Z0-9._~:/?#[\]@!$&'()*+,;=%-]*)?/gi;
+  for (const m of contentBlob.matchAll(anyHttpRegex)) {
+    const clean = m[0].replace(/['"`),;\\]+$/, "");
+    if (
+      clean.length <= 220 &&
+      !/w3\.org|schema\.org|reactjs\.org|mozilla\.org|fonts\.googleapis\.com|fonts\.gstatic\.com/i.test(clean)
+    ) {
+      extraUrlSet.add(clean);
+    }
+  }
+
+  return {
+    apis: Array.from(apiSet),
+    discovered_urls: Array.from(extraUrlSet).slice(0, 60)
+  };
 }
 
 function detectTechHints(html, headers) {
@@ -604,7 +618,6 @@ export default async function handler(req, res) {
 
   let decryptionInfo = attemptCodeDecryption(fetchResult.text);
 
-  // Agar AES cookie challenge decrypt ho jaye aur redirect URL mile to cookie ke sath dobara fetch karein
   if (
     decryptionInfo.was_encrypted &&
     decryptionInfo.decrypted &&
@@ -647,8 +660,11 @@ export default async function handler(req, res) {
   const techHints = detectTechHints(rawHtml, fetchResult.headers);
 
   let combinedScanText = `${rawHtml}\n${decryptionInfo.unpacked_text || ""}`;
+  let scannedScriptsCount = 0;
+
   if (deepScan && assets.scripts.length > 0 && (mode === "full" || mode === "apis")) {
     const topScripts = assets.scripts.slice(0, 3);
+    scannedScriptsCount = topScripts.length;
     const scriptResults = await Promise.all(
       topScripts.map((jsUrl) => safeFetchText(jsUrl, 3500, 400 * 1024))
     );
@@ -659,7 +675,19 @@ export default async function handler(req, res) {
     }
   }
 
-  const webApis = extractWebApis(combinedScanText, baseUrl);
+  const extractedEndpoints = extractWebApis(combinedScanText, baseUrl);
+  const webApis = extractedEndpoints.apis;
+  const discoveredUrls = extractedEndpoints.discovered_urls;
+
+  const extractionDebug = {
+    raw_html_length: rawHtml.length,
+    raw_html_lines: rawHtml ? rawHtml.split("\n").length : 0,
+    script_tags_found: (rawHtml.match(/<script\b/gi) || []).length,
+    link_tags_found: (rawHtml.match(/<link\b/gi) || []).length,
+    anchor_tags_found: (rawHtml.match(/<a\b/gi) || []).length,
+    img_tags_found: (rawHtml.match(/<img\b/gi) || []).length,
+    deep_scripts_fetched: scannedScriptsCount
+  };
 
   const cleanDecryptionStatus = {
     was_encrypted: decryptionInfo.was_encrypted,
@@ -675,7 +703,9 @@ export default async function handler(req, res) {
       target: baseUrl,
       total_apis: webApis.length,
       web_apis: webApis,
+      discovered_urls: discoveredUrls,
       decryption_status: cleanDecryptionStatus,
+      extraction_debug: extractionDebug,
       branding: {
         devp: "Dark Empire",
         owner: "Sardar Daud Arain"
@@ -690,6 +720,7 @@ export default async function handler(req, res) {
       total_logos: logos.length,
       logos,
       decryption_status: cleanDecryptionStatus,
+      extraction_debug: extractionDebug,
       branding: {
         devp: "Dark Empire",
         owner: "Sardar Daud Arain"
@@ -704,6 +735,7 @@ export default async function handler(req, res) {
       total_socials: socialLinks.length,
       social_links: socialLinks,
       decryption_status: cleanDecryptionStatus,
+      extraction_debug: extractionDebug,
       branding: {
         devp: "Dark Empire",
         owner: "Sardar Daud Arain"
@@ -721,11 +753,13 @@ export default async function handler(req, res) {
       truncated: fetchResult.truncated
     },
     decryption_status: cleanDecryptionStatus,
+    extraction_debug: extractionDebug,
     meta,
     tech_hints: techHints,
     web_apis: {
       count: webApis.length,
-      list: webApis
+      list: webApis,
+      discovered_urls: discoveredUrls
     },
     logos: {
       count: logos.length,
